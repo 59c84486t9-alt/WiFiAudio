@@ -15,10 +15,10 @@ Experimental native Windows sender + native iOS receiver. This is **not** an App
 4. Put PC and iPhone on the same Wi-Fi/LAN. Start the sender, then select the discovered PC or scan its QR code. Manual IP is also available.
 
 ## Known limitations / engineering follow-ups
-- **Unverified starter implementation:** no macOS Xcode or .NET SDK is available in this environment to compile-test the code. Use GitHub Actions logs to find any platform/API issues.
+- Both GitHub Actions builds have passed; end-to-end audio still needs testing on a Windows PC and iPhone.
 - Unencrypted and unauthenticated PCM stream: **trusted home LAN only**, not exposed to the Internet. QR contains a connection address, not a secure pairing credential.
 - Only one receiver at a time; TCP can introduce noticeable latency and backlog.
-- Audio capture follows Windows default output device; mono/stereo mix only.
+- Audio capture follows the Windows default output device and downmixes surround output to stereo; per-application selection is not available.
 - Windows mDNS/Bonjour discovery may depend on firewall/network configuration; manual IP is the fallback.
 - iOS lock-screen playback uses `.playback` audio session and `UIBackgroundModes=audio`; iOS may suspend/restrict playback after interruption or when playback is no longer active.
 - No Windows virtual audio output device, no AirPlay protocol compatibility, no Opus/WebRTC yet.
