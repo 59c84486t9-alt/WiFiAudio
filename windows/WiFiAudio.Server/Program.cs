@@ -90,7 +90,7 @@ public sealed class MainForm : Form
         capture.DataAvailable += (_, e) => buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
         ISampleProvider samples = buffer.ToSampleProvider();
         if (samples.WaveFormat.Channels == 1) samples = new MonoToStereoSampleProvider(samples);
-        else if (samples.WaveFormat.Channels != 2) throw new NotSupportedException("Only mono/stereo Windows output is supported in v1");
+        else if (samples.WaveFormat.Channels != 2) samples = new DownmixToStereoSampleProvider(samples);
         samples = new WdlResamplingSampleProvider(samples, 48000);
         var pcm = new SampleToWaveProvider16(samples);
         byte[] packet = new byte[3840]; // 20ms, 48kHz, 2ch, 16-bit
@@ -115,3 +115,69 @@ public sealed class MainForm : Form
         finally { capture.StopRecording(); }
     }
 }
+
+/// <summary>Downmixes Windows' interleaved surround mix to the stereo stream expected by iOS.</summary>
+internal sealed class DownmixToStereoSampleProvider : ISampleProvider
+{
+    private const float SurroundGain = 0.70710678f;
+    private readonly ISampleProvider source;
+    private readonly int inputChannels;
+    private float[] input = Array.Empty<float>();
+
+    public DownmixToStereoSampleProvider(ISampleProvider source)
+    {
+        this.source = source;
+        inputChannels = source.WaveFormat.Channels;
+        if (inputChannels < 3) throw new ArgumentException("Downmix requires at least three input channels", nameof(source));
+        WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(source.WaveFormat.SampleRate, 2);
+    }
+
+    public WaveFormat WaveFormat { get; }
+
+    public int Read(float[] destination, int offset, int count)
+    {
+        int outputSamples = count - count % 2;
+        int framesRequested = outputSamples / 2;
+        int inputSamplesRequested = framesRequested * inputChannels;
+        if (input.Length < inputSamplesRequested) input = new float[inputSamplesRequested];
+
+        int samplesRead = source.Read(input, 0, inputSamplesRequested);
+        int framesRead = samplesRead / inputChannels;
+        for (int frame = 0; frame < framesRead; frame++)
+        {
+            int sample = frame * inputChannels;
+            float left = input[sample];
+            float right = input[sample + 1];
+
+            if (inputChannels == 4)
+            {
+                left += input[sample + 2] * SurroundGain;
+                right += input[sample + 3] * SurroundGain;
+            }
+            else
+            {
+                // Standard Windows order: FL, FR, FC, [LFE], back/side left, back/side right.
+                left += input[sample + 2] * SurroundGain;
+                right += input[sample + 2] * SurroundGain;
+
+                int firstSurround = inputChannels is 6 or 8 ? 4 : 3; // Skip the LFE channel in 5.1/7.1.
+                for (int channel = firstSurround; channel < inputChannels; channel++)
+                {
+                    if (inputChannels > 8)
+                    {
+                        // For uncommon layouts, fold remaining channels into alternating sides.
+                        if ((channel & 1) == 0) left += input[sample + channel] * 0.5f;
+                        else right += input[sample + channel] * 0.5f;
+                    }
+                    else if ((channel & 1) == (firstSurround & 1)) left += input[sample + channel] * SurroundGain;
+                    else right += input[sample + channel] * SurroundGain;
+                }
+            }
+
+            destination[offset + frame * 2] = Math.Clamp(left, -1f, 1f);
+            destination[offset + frame * 2 + 1] = Math.Clamp(right, -1f, 1f);
+        }
+        return framesRead * 2;
+    }
+}
+
