@@ -1,0 +1,25 @@
+name: iOS IPA
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+      - name: Build unsigned iPhone app
+        run: |
+          xcodebuild -project ios/WiFiAudio.xcodeproj -scheme WiFiAudio -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package IPA
+        run: |
+          mkdir -p staging/Payload
+          cp -R build/Build/Products/Release-iphoneos/WiFiAudio.app staging/Payload/
+          cd staging && zip -qry ../WiFiAudio-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WiFiAudio-unsigned-IPA
+          path: WiFiAudio-unsigned.ipa

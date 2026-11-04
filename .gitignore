@@ -1,0 +1,8 @@
+.DS_Store
+**/bin/
+**/obj/
+**/build/
+DerivedData/
+publish/
+staging/
+*.user
