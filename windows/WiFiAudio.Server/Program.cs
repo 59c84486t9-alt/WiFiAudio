@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using Makaretu.Dns;
@@ -16,7 +17,8 @@ internal static class Program
 
 public sealed class MainForm : Form
 {
-    private readonly Label status = new() { Dock = DockStyle.Top, Height = 55, TextAlign = ContentAlignment.MiddleCenter };
+    private readonly Label status = new() { Dock = DockStyle.Top, Height = 42, TextAlign = ContentAlignment.MiddleCenter };
+    private readonly Label latency = new() { Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.MiddleCenter, Text = "Latency: waiting for iPhone" };
     private readonly PictureBox qr = new() { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom };
     private readonly Button toggle = new() { Dock = DockStyle.Bottom, Height = 50, Text = "Start streaming server" };
     private CancellationTokenSource? cts;
@@ -27,7 +29,7 @@ public sealed class MainForm : Form
     public MainForm()
     {
         Text = "WiFiAudio • Windows sender"; Width = 380; Height = 470;
-        Controls.Add(qr); Controls.Add(status); Controls.Add(toggle);
+        Controls.Add(qr); Controls.Add(latency); Controls.Add(status); Controls.Add(toggle);
         toggle.Click += async (_, _) => { if (cts is null) Start(); else await StopAsync(); };
         FormClosing += (_, _) => { cts?.Cancel(); listener?.Stop(); discovery?.Dispose(); };
         status.Text = "Stopped";
@@ -48,7 +50,7 @@ public sealed class MainForm : Form
             using var data = gen.CreateQrCode(uri, QRCodeGenerator.ECCLevel.Q);
             using var code = new QRCode(data);
             qr.Image = new Bitmap(code.GetGraphic(8));
-            toggle.Text = "Stop"; status.Text = $"Waiting for iPhone • {uri}";
+            toggle.Text = "Stop"; status.Text = $"Waiting for iPhone • {uri}"; latency.Text = "Latency: waiting for iPhone";
             _ = AcceptLoop(cts.Token);
         }
         catch (Exception ex) { status.Text = ex.Message; _ = StopAsync(); }
@@ -59,11 +61,16 @@ public sealed class MainForm : Form
         cts?.Cancel(); listener?.Stop(); discovery?.Dispose(); discovery = null;
         cts?.Dispose(); cts = null; listener = null;
         toggle.Text = "Start streaming server"; status.Text = "Stopped";
+        latency.Text = "Latency: waiting for iPhone";
         qr.Image?.Dispose(); qr.Image = null;
         await Task.CompletedTask;
     }
 
     private void SetStatus(string value) { if (!IsDisposed && IsHandleCreated) BeginInvoke(() => status.Text = value); }
+    private void SetLatency(string value, Color color)
+    {
+        if (!IsDisposed && IsHandleCreated) BeginInvoke(() => { latency.Text = value; latency.ForeColor = color; });
+    }
 
     private async Task AcceptLoop(CancellationToken token)
     {
@@ -74,6 +81,7 @@ public sealed class MainForm : Form
                 using var client = await listener!.AcceptTcpClientAsync(token);
                 client.NoDelay = true;
                 SetStatus("iPhone connected • streaming desktop audio");
+                SetLatency("Latency: measuring…", Color.Black);
                 await StreamClient(client, token);
                 SetStatus("Disconnected • waiting for iPhone");
             }
@@ -83,7 +91,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private static async Task StreamClient(TcpClient client, CancellationToken token)
+    private async Task StreamClient(TcpClient client, CancellationToken token)
     {
         using var capture = new WasapiLoopbackCapture();
         var buffer = new BufferedWaveProvider(capture.WaveFormat) { BufferDuration = TimeSpan.FromSeconds(2), DiscardOnBufferOverflow = true };
@@ -95,8 +103,13 @@ public sealed class MainForm : Form
         var pcm = new SampleToWaveProvider16(samples);
         byte[] packet = new byte[3840]; // 20ms, 48kHz, 2ch, 16-bit
         byte[] length = new byte[4];
+        byte[] pingTimestamp = new byte[8];
         using var stream = client.GetStream();
+        var latencyMetrics = new LatencyMetrics();
+        using var reportCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task reportTask = ReadLatencyReports(stream, buffer, capture, latencyMetrics, reportCts.Token);
         capture.StartRecording();
+        long lastPing = Stopwatch.GetTimestamp();
         try
         {
             while (!token.IsCancellationRequested && client.Connected)
@@ -110,9 +123,54 @@ public sealed class MainForm : Form
                 BinaryPrimitives.WriteInt32BigEndian(length, read);
                 await stream.WriteAsync(length, token);
                 await stream.WriteAsync(packet.AsMemory(0, read), token);
+
+                if (Stopwatch.GetElapsedTime(lastPing).TotalMilliseconds >= 1000)
+                {
+                    long sentAt = Stopwatch.GetTimestamp();
+                    Interlocked.Exchange(ref latencyMetrics.PendingPingTimestamp, sentAt);
+                    BinaryPrimitives.WriteInt32BigEndian(length, -1); // Reserved marker for a latency ping.
+                    BinaryPrimitives.WriteInt64BigEndian(pingTimestamp, sentAt);
+                    await stream.WriteAsync(length, token);
+                    await stream.WriteAsync(pingTimestamp, token);
+                    lastPing = sentAt;
+                }
             }
         }
-        finally { capture.StopRecording(); }
+        finally
+        {
+            reportCts.Cancel();
+            capture.StopRecording();
+            try { await reportTask; }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
+    private async Task ReadLatencyReports(NetworkStream stream, BufferedWaveProvider buffer,
+        WasapiLoopbackCapture capture, LatencyMetrics metrics, CancellationToken token)
+    {
+        byte[] report = new byte[20];
+        while (!token.IsCancellationRequested)
+        {
+            await stream.ReadExactlyAsync(report.AsMemory(), token);
+            if (BinaryPrimitives.ReadUInt32BigEndian(report.AsSpan(0, 4)) != 0x57464131) continue; // WFA1
+            long echoedTimestamp = BinaryPrimitives.ReadInt64BigEndian(report.AsSpan(4, 8));
+            if (echoedTimestamp != Interlocked.Read(ref metrics.PendingPingTimestamp)) continue;
+
+            double senderBufferMs = buffer.BufferedBytes * 1000.0 / capture.WaveFormat.AverageBytesPerSecond;
+            double networkMs = Stopwatch.GetElapsedTime(echoedTimestamp).TotalMilliseconds / 2.0;
+            double phoneQueueMs = BinaryPrimitives.ReadUInt32BigEndian(report.AsSpan(12, 4));
+            double phoneOutputMs = BinaryPrimitives.ReadUInt32BigEndian(report.AsSpan(16, 4));
+            double estimateMs = senderBufferMs + networkMs + phoneQueueMs + phoneOutputMs;
+            Color color = estimateMs < 80 ? Color.DarkGreen : estimateMs < 180 ? Color.DarkGoldenrod : Color.DarkRed;
+            SetLatency($"Latency ~{estimateMs:0} ms  •  PC {senderBufferMs:0}  Wi-Fi {networkMs:0}  iPhone {phoneQueueMs + phoneOutputMs:0}", color);
+        }
+    }
+
+    private sealed class LatencyMetrics
+    {
+        public long PendingPingTimestamp;
     }
 }
 

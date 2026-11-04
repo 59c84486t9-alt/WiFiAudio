@@ -15,6 +15,8 @@ final class AudioReceiver: ObservableObject {
     private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!
     private var incoming = Data()
     private var playbackStarted = false
+    private let playbackQueueLock = NSLock()
+    private var queuedPlaybackFrames = 0
 
     init() {
         engine.attach(player)
@@ -80,6 +82,7 @@ final class AudioReceiver: ObservableObject {
     func disconnect() {
         connection?.cancel(); connection = nil
         player.stop(); engine.stop()
+        playbackQueueLock.lock(); queuedPlaybackFrames = 0; playbackQueueLock.unlock()
         connected = false
         status = "Not connected"
     }
@@ -95,6 +98,13 @@ final class AudioReceiver: ObservableObject {
     private func parseFrames() {
         while incoming.count >= 4 {
             let size = incoming.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            if size == UInt32.max {
+                guard incoming.count >= 12 else { return }
+                let token = incoming[4..<12].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+                incoming.removeSubrange(0..<12)
+                sendLatencyReport(echoing: token)
+                continue
+            }
             guard size > 0 && size <= 65536 && size % 4 == 0 else {
                 incoming.removeAll(); connection?.cancel(); return
             }
@@ -118,7 +128,38 @@ final class AudioReceiver: ObservableObject {
                 channels[1][i] = Float(Int16(littleEndian: pcm[i * 2 + 1])) / 32768.0
             }
         }
-        player.scheduleBuffer(buffer)
+        playbackQueueLock.lock(); queuedPlaybackFrames += frames; playbackQueueLock.unlock()
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            guard let self else { return }
+            self.playbackQueueLock.lock()
+            self.queuedPlaybackFrames = max(0, self.queuedPlaybackFrames - frames)
+            self.playbackQueueLock.unlock()
+        }
         if !playbackStarted { player.play(); playbackStarted = true }
+    }
+
+    private func sendLatencyReport(echoing token: UInt64) {
+        guard let connection else { return }
+        playbackQueueLock.lock()
+        let queuedFrames = queuedPlaybackFrames
+        playbackQueueLock.unlock()
+
+        let session = AVAudioSession.sharedInstance()
+        let phoneQueueMs = UInt32(max(0, min(10_000, queuedFrames * 1000 / 48_000)))
+        let outputLatencyMs = UInt32(max(0, min(10_000, Int((session.outputLatency + session.ioBufferDuration) * 1000))))
+        var report = Data()
+        appendBigEndian(UInt32(0x57464131), to: &report) // WFA1
+        appendBigEndian(token, to: &report)
+        appendBigEndian(phoneQueueMs, to: &report)
+        appendBigEndian(outputLatencyMs, to: &report)
+        connection.send(content: report, completion: .contentProcessed { [weak self] error in
+            guard let error else { return }
+            DispatchQueue.main.async { self?.status = "Latency report error: \(error.localizedDescription)" }
+        })
+    }
+
+    private func appendBigEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
     }
 }
