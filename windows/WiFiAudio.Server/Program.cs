@@ -94,14 +94,15 @@ public sealed class MainForm : Form
     private async Task StreamClient(TcpClient client, CancellationToken token)
     {
         using var capture = new WasapiLoopbackCapture();
-        var buffer = new BufferedWaveProvider(capture.WaveFormat) { BufferDuration = TimeSpan.FromSeconds(2), DiscardOnBufferOverflow = true };
+        var buffer = new BufferedWaveProvider(capture.WaveFormat) { BufferDuration = TimeSpan.FromMilliseconds(250), DiscardOnBufferOverflow = true };
         capture.DataAvailable += (_, e) => buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
         ISampleProvider samples = buffer.ToSampleProvider();
         if (samples.WaveFormat.Channels == 1) samples = new MonoToStereoSampleProvider(samples);
         else if (samples.WaveFormat.Channels != 2) samples = new DownmixToStereoSampleProvider(samples);
         samples = new WdlResamplingSampleProvider(samples, 48000);
         var pcm = new SampleToWaveProvider16(samples);
-        byte[] packet = new byte[3840]; // 20ms, 48kHz, 2ch, 16-bit
+        const int frameBytes = 1920; // 10ms, 48kHz, 2ch, 16-bit
+        byte[] audioFrame = new byte[4 + frameBytes];
         byte[] length = new byte[4];
         byte[] pingTimestamp = new byte[8];
         using var stream = client.GetStream();
@@ -114,15 +115,23 @@ public sealed class MainForm : Form
         {
             while (!token.IsCancellationRequested && client.Connected)
             {
-                // Wait until there is approximately one frame of source audio.
-                if (buffer.BufferedBytes < capture.WaveFormat.AverageBytesPerSecond / 50)
+                // Wait until there is approximately one 10ms frame of source audio.
+                if (buffer.BufferedBytes < capture.WaveFormat.AverageBytesPerSecond / 100)
                 { await Task.Delay(5, token); continue; }
-                int read = pcm.Read(packet, 0, packet.Length);
+
+                // If capture or sending briefly falls behind, discard old audio to stay live.
+                int backlogLimit = capture.WaveFormat.AverageBytesPerSecond * 6 / 100; // 60ms
+                while (buffer.BufferedBytes > backlogLimit)
+                {
+                    int discarded = pcm.Read(audioFrame, 4, frameBytes);
+                    if (discarded <= 0) break;
+                }
+
+                int read = pcm.Read(audioFrame, 4, frameBytes);
                 if (read <= 0) { await Task.Delay(5, token); continue; }
                 read -= read % 4;
-                BinaryPrimitives.WriteInt32BigEndian(length, read);
-                await stream.WriteAsync(length, token);
-                await stream.WriteAsync(packet.AsMemory(0, read), token);
+                BinaryPrimitives.WriteInt32BigEndian(audioFrame.AsSpan(0, 4), read);
+                await stream.WriteAsync(audioFrame.AsMemory(0, 4 + read), token);
 
                 if (Stopwatch.GetElapsedTime(lastPing).TotalMilliseconds >= 1000)
                 {

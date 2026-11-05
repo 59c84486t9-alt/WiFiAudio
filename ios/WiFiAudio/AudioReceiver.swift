@@ -17,6 +17,8 @@ final class AudioReceiver: ObservableObject {
     private var playbackStarted = false
     private let playbackQueueLock = NSLock()
     private var queuedPlaybackFrames = 0
+    private var playbackGeneration: UInt64 = 0
+    private let maxQueuedPlaybackFrames = 3840 // 80ms at 48kHz
 
     init() {
         engine.attach(player)
@@ -80,9 +82,13 @@ final class AudioReceiver: ObservableObject {
     }
 
     func disconnect() {
+        playbackQueueLock.lock()
+        playbackGeneration &+= 1
+        queuedPlaybackFrames = 0
+        playbackQueueLock.unlock()
         connection?.cancel(); connection = nil
         player.stop(); engine.stop()
-        playbackQueueLock.lock(); queuedPlaybackFrames = 0; playbackQueueLock.unlock()
+        playbackStarted = false
         connected = false
         status = "Not connected"
     }
@@ -128,11 +134,27 @@ final class AudioReceiver: ObservableObject {
                 channels[1][i] = Float(Int16(littleEndian: pcm[i * 2 + 1])) / 32768.0
             }
         }
-        playbackQueueLock.lock(); queuedPlaybackFrames += frames; playbackQueueLock.unlock()
+        playbackQueueLock.lock()
+        let shouldDropBacklog = queuedPlaybackFrames + frames > maxQueuedPlaybackFrames
+        if shouldDropBacklog {
+            queuedPlaybackFrames = 0
+            playbackGeneration &+= 1
+        }
+        let generation = playbackGeneration
+        queuedPlaybackFrames += frames
+        playbackQueueLock.unlock()
+
+        if shouldDropBacklog {
+            // Keep playback close to live audio instead of draining a stale queue.
+            player.stop()
+            playbackStarted = false
+        }
         player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             guard let self else { return }
             self.playbackQueueLock.lock()
-            self.queuedPlaybackFrames = max(0, self.queuedPlaybackFrames - frames)
+            if self.playbackGeneration == generation {
+                self.queuedPlaybackFrames = max(0, self.queuedPlaybackFrames - frames)
+            }
             self.playbackQueueLock.unlock()
         }
         if !playbackStarted { player.play(); playbackStarted = true }
