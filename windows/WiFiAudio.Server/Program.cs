@@ -18,7 +18,7 @@ internal static class Program
 public sealed class MainForm : Form
 {
     private readonly Label status = new() { Dock = DockStyle.Top, Height = 42, TextAlign = ContentAlignment.MiddleCenter };
-    private readonly Label latency = new() { Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.MiddleCenter, Text = "Latency: waiting for iPhone" };
+    private readonly Label latency = new() { Dock = DockStyle.Top, Height = 42, TextAlign = ContentAlignment.MiddleCenter, Text = "Latency: waiting for iPhone" };
     private readonly PictureBox qr = new() { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom };
     private readonly Button toggle = new() { Dock = DockStyle.Bottom, Height = 50, Text = "Start streaming server" };
     private CancellationTokenSource? cts;
@@ -173,7 +173,7 @@ public sealed class MainForm : Form
             double phoneOutputMs = BinaryPrimitives.ReadUInt32BigEndian(report.AsSpan(16, 4));
             double estimateMs = senderBufferMs + networkMs + phoneQueueMs + phoneOutputMs;
             Color color = estimateMs < 80 ? Color.DarkGreen : estimateMs < 180 ? Color.DarkGoldenrod : Color.DarkRed;
-            SetLatency($"Latency ~{estimateMs:0} ms  •  PC {senderBufferMs:0}  Wi-Fi {networkMs:0}  iPhone {phoneQueueMs + phoneOutputMs:0}", color);
+            SetLatency($"Latency ~{estimateMs:0} ms  •  PC {senderBufferMs:0}  •  Wi-Fi {networkMs:0} ms\n iOS queue {phoneQueueMs:0} ms  •  output route {phoneOutputMs:0} ms", color);
         }
     }
 
@@ -247,4 +247,5 @@ internal sealed class DownmixToStereoSampleProvider : ISampleProvider
         return framesRead * 2;
     }
 }
+
 

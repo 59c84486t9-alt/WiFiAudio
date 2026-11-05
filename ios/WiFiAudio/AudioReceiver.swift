@@ -18,7 +18,9 @@ final class AudioReceiver: ObservableObject {
     private let playbackQueueLock = NSLock()
     private var queuedPlaybackFrames = 0
     private var playbackGeneration: UInt64 = 0
-    private let maxQueuedPlaybackFrames = 3840 // 80ms at 48kHz
+    // Allow short Wi-Fi/TCP delivery bursts without repeatedly stopping playback.
+    // Overflow still drops stale audio to recover toward live playback.
+    private let maxQueuedPlaybackFrames = 5760 // 120ms at 48kHz
 
     init() {
         engine.attach(player)
@@ -185,3 +187,4 @@ final class AudioReceiver: ObservableObject {
         withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
     }
 }
+
