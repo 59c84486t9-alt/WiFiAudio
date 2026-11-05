@@ -2,6 +2,7 @@ import Foundation
 import Network
 import AVFoundation
 import MediaPlayer
+import UIKit
 
 final class AudioReceiver: ObservableObject {
     @Published var status = "Not connected"
@@ -21,12 +22,47 @@ final class AudioReceiver: ObservableObject {
     // Allow short Wi-Fi/TCP delivery bursts without repeatedly stopping playback.
     // Overflow still drops stale audio to recover toward live playback.
     private let maxQueuedPlaybackFrames = 5760 // 120ms at 48kHz
+    private var audioSessionObservers: [NSObjectProtocol] = []
 
     init() {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [MPMediaItemPropertyTitle: "Windows Audio", MPMediaItemPropertyArtist: "WiFiAudio"]
+        observeAudioSessionLifecycle()
         discover()
+    }
+
+    deinit {
+        audioSessionObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    private func observeAudioSessionLifecycle() {
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        let backgroundToken = center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { [weak self] _ in
+            guard let self else { return }
+            self.queue.async { [weak self] in self?.reactivateAudioSessionIfNeeded() }
+        }
+        let interruptionToken = center.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: nil) { [weak self] notification in
+            guard let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: rawType) == .ended,
+                  let self else { return }
+            self.queue.async { [weak self] in self?.reactivateAudioSessionIfNeeded() }
+        }
+        audioSessionObservers = [backgroundToken, interruptionToken]
+    }
+
+    private func reactivateAudioSessionIfNeeded() {
+        guard connected else { return }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setActive(true)
+            if !engine.isRunning { try engine.start() }
+            if !player.isPlaying { player.play() }
+            playbackStarted = true
+        } catch {
+            DispatchQueue.main.async { self.status = "Audio resume error: \(error.localizedDescription)" }
+        }
     }
 
     func discover() {
