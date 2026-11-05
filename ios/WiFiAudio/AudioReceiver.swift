@@ -173,20 +173,16 @@ final class AudioReceiver: ObservableObject {
             }
         }
         playbackQueueLock.lock()
-        let shouldDropBacklog = queuedPlaybackFrames + frames > maxQueuedPlaybackFrames
-        if shouldDropBacklog {
-            queuedPlaybackFrames = 0
-            playbackGeneration &+= 1
+        if queuedPlaybackFrames + frames > maxQueuedPlaybackFrames {
+            // Keep already queued audio playing; discard this new chunk instead of
+            // stopping and restarting AVAudioPlayerNode, which creates audible gaps.
+            playbackQueueLock.unlock()
+            return
         }
         let generation = playbackGeneration
         queuedPlaybackFrames += frames
         playbackQueueLock.unlock()
 
-        if shouldDropBacklog {
-            // Keep playback close to live audio instead of draining a stale queue.
-            player.stop()
-            playbackStarted = false
-        }
         player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             guard let self else { return }
             self.playbackQueueLock.lock()
@@ -195,7 +191,7 @@ final class AudioReceiver: ObservableObject {
             }
             self.playbackQueueLock.unlock()
         }
-        if !playbackStarted { player.play(); playbackStarted = true }
+        if !playbackStarted || !player.isPlaying { player.play(); playbackStarted = true }
     }
 
     private func sendLatencyReport(echoing token: UInt64) {
