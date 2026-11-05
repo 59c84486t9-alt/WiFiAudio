@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Text;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using Makaretu.Dns;
@@ -19,17 +20,22 @@ public sealed class MainForm : Form
 {
     private readonly Label status = new() { Dock = DockStyle.Top, Height = 42, TextAlign = ContentAlignment.MiddleCenter };
     private readonly Label latency = new() { Dock = DockStyle.Top, Height = 42, TextAlign = ContentAlignment.MiddleCenter, Text = "Latency: waiting for iPhone" };
+    private readonly ComboBox transport = new() { Dock = DockStyle.Top, Height = 30, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly PictureBox qr = new() { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom };
     private readonly Button toggle = new() { Dock = DockStyle.Bottom, Height = 50, Text = "Start streaming server" };
     private CancellationTokenSource? cts;
     private TcpListener? listener;
+    private UdpClient? udpServer;
     private ServiceDiscovery? discovery;
+    private bool udpMode;
     private const int Port = 49321;
 
     public MainForm()
     {
         Text = "WiFiAudio • Windows sender"; Width = 380; Height = 470;
-        Controls.Add(qr); Controls.Add(latency); Controls.Add(status); Controls.Add(toggle);
+        transport.Items.AddRange(["TCP • stable", "UDP • experimental"]);
+        transport.SelectedIndex = 0;
+        Controls.Add(qr); Controls.Add(latency); Controls.Add(status); Controls.Add(transport); Controls.Add(toggle);
         toggle.Click += async (_, _) => { if (cts is null) Start(); else await StopAsync(); };
         FormClosing += (_, _) => { cts?.Cancel(); listener?.Stop(); discovery?.Dispose(); };
         status.Text = "Stopped";
@@ -38,29 +44,36 @@ public sealed class MainForm : Form
     private void Start()
     {
         cts = new CancellationTokenSource();
-        listener = new TcpListener(IPAddress.Any, Port);
+        udpMode = transport.SelectedIndex == 1;
         try
         {
-            listener.Start();
-            discovery = new ServiceDiscovery();
-            discovery.Advertise(new ServiceProfile("WiFiAudio-PC", "_wifiaudio._tcp", (ushort)Port));
+            if (udpMode) udpServer = new UdpClient(Port);
+            else
+            {
+                listener = new TcpListener(IPAddress.Any, Port);
+                listener.Start();
+                discovery = new ServiceDiscovery();
+                discovery.Advertise(new ServiceProfile("WiFiAudio-PC", "_wifiaudio._tcp", (ushort)Port));
+            }
             var ip = Dns.GetHostAddresses(Dns.GetHostName()).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a));
-            var uri = $"wifiaudio://{ip ?? IPAddress.Loopback}:{Port}";
+            var uri = $"wifiaudio://{ip ?? IPAddress.Loopback}:{Port}" + (udpMode ? "?transport=udp" : "");
             using var gen = new QRCodeGenerator();
             using var data = gen.CreateQrCode(uri, QRCodeGenerator.ECCLevel.Q);
             using var code = new QRCode(data);
             qr.Image = new Bitmap(code.GetGraphic(8));
-            toggle.Text = "Stop"; status.Text = $"Waiting for iPhone • {uri}"; latency.Text = "Latency: waiting for iPhone";
-            _ = AcceptLoop(cts.Token);
+            toggle.Text = "Stop"; transport.Enabled = false;
+            status.Text = udpMode ? "Scan QR to connect • UDP experimental" : $"Waiting for iPhone • {uri}";
+            latency.Text = "Latency: waiting for iPhone";
+            if (udpMode) _ = UdpAcceptLoop(cts.Token); else _ = AcceptLoop(cts.Token);
         }
         catch (Exception ex) { status.Text = ex.Message; _ = StopAsync(); }
     }
 
     private async Task StopAsync()
     {
-        cts?.Cancel(); listener?.Stop(); discovery?.Dispose(); discovery = null;
+        cts?.Cancel(); listener?.Stop(); udpServer?.Close(); udpServer = null; discovery?.Dispose(); discovery = null;
         cts?.Dispose(); cts = null; listener = null;
-        toggle.Text = "Start streaming server"; status.Text = "Stopped";
+        toggle.Text = "Start streaming server"; transport.Enabled = true; status.Text = "Stopped";
         latency.Text = "Latency: waiting for iPhone";
         qr.Image?.Dispose(); qr.Image = null;
         await Task.CompletedTask;
@@ -89,6 +102,116 @@ public sealed class MainForm : Form
             catch (ObjectDisposedException) { break; }
             catch (Exception ex) { SetStatus($"Stream error: {ex.Message}"); await Task.Delay(1000); }
         }
+    }
+
+    private async Task UdpAcceptLoop(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                var datagram = await udpServer!.ReceiveAsync(token);
+                if (!HasTag(datagram.Buffer, "WFH1")) continue;
+                await udpServer.SendAsync(Encoding.ASCII.GetBytes("WFOK"), datagram.RemoteEndPoint, token);
+                SetStatus("iPhone connected • streaming UDP audio");
+                SetLatency("Latency: measuring…", Color.Black);
+                await StreamUdp(datagram.RemoteEndPoint, token);
+                SetStatus("UDP stream ended • waiting for iPhone");
+            }
+            catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException) { break; }
+            catch (Exception ex) { SetStatus($"UDP error: {ex.Message}"); await Task.Delay(1000, token); }
+        }
+    }
+
+    private async Task StreamUdp(IPEndPoint peer, CancellationToken token)
+    {
+        using var capture = new WasapiLoopbackCapture();
+        var buffer = new BufferedWaveProvider(capture.WaveFormat) { BufferDuration = TimeSpan.FromMilliseconds(250), DiscardOnBufferOverflow = true };
+        capture.DataAvailable += (_, e) => buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
+        ISampleProvider samples = buffer.ToSampleProvider();
+        if (samples.WaveFormat.Channels == 1) samples = new MonoToStereoSampleProvider(samples);
+        else if (samples.WaveFormat.Channels != 2) samples = new DownmixToStereoSampleProvider(samples);
+        samples = new WdlResamplingSampleProvider(samples, 48000);
+        var pcm = new SampleToWaveProvider16(samples);
+        const int frameBytes = 3840; // 20ms, 48kHz, 2ch, 16-bit
+        byte[] audioDatagram = new byte[8 + frameBytes];
+        Encoding.ASCII.GetBytes("WFAA").CopyTo(audioDatagram, 0);
+        byte[] ping = new byte[12];
+        Encoding.ASCII.GetBytes("WFAP").CopyTo(ping, 0);
+        using var reportCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var latencyMetrics = new LatencyMetrics();
+        Task reportTask = ReadUdpLatencyReports(peer, buffer, capture, latencyMetrics, reportCts.Token);
+        capture.StartRecording();
+        long lastPing = Stopwatch.GetTimestamp();
+        uint sequence = 0;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                if (buffer.BufferedBytes < capture.WaveFormat.AverageBytesPerSecond / 50)
+                { await Task.Delay(5, token); continue; }
+
+                int backlogLimit = capture.WaveFormat.AverageBytesPerSecond * 12 / 100; // 120ms
+                while (buffer.BufferedBytes > backlogLimit)
+                {
+                    int discarded = pcm.Read(audioDatagram, 8, frameBytes);
+                    if (discarded <= 0) break;
+                }
+
+                int read = pcm.Read(audioDatagram, 8, frameBytes);
+                if (read <= 0) { await Task.Delay(5, token); continue; }
+                read -= read % 4;
+                BinaryPrimitives.WriteUInt32BigEndian(audioDatagram.AsSpan(4, 4), sequence++);
+                await udpServer!.SendAsync(audioDatagram.AsMemory(0, 8 + read), peer, token);
+
+                if (Stopwatch.GetElapsedTime(lastPing).TotalMilliseconds >= 1000)
+                {
+                    long sentAt = Stopwatch.GetTimestamp();
+                    Interlocked.Exchange(ref latencyMetrics.PendingPingTimestamp, sentAt);
+                    BinaryPrimitives.WriteInt64BigEndian(ping.AsSpan(4, 8), sentAt);
+                    await udpServer.SendAsync(ping.AsMemory(), peer, token);
+                    lastPing = sentAt;
+                }
+            }
+        }
+        finally
+        {
+            reportCts.Cancel();
+            capture.StopRecording();
+            try { await reportTask; }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
+    private async Task ReadUdpLatencyReports(IPEndPoint peer, BufferedWaveProvider buffer,
+        WasapiLoopbackCapture capture, LatencyMetrics metrics, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            var datagram = await udpServer!.ReceiveAsync(token);
+            if (!datagram.RemoteEndPoint.Equals(peer)) continue;
+            byte[] report = datagram.Buffer;
+            if (report.Length != 20 || !HasTag(report, "WFA1")) continue;
+            long echoedTimestamp = BinaryPrimitives.ReadInt64BigEndian(report.AsSpan(4, 8));
+            if (echoedTimestamp != Interlocked.Read(ref metrics.PendingPingTimestamp)) continue;
+
+            double senderBufferMs = buffer.BufferedBytes * 1000.0 / capture.WaveFormat.AverageBytesPerSecond;
+            double networkMs = Stopwatch.GetElapsedTime(echoedTimestamp).TotalMilliseconds / 2.0;
+            double phoneQueueMs = BinaryPrimitives.ReadUInt32BigEndian(report.AsSpan(12, 4));
+            double phoneOutputMs = BinaryPrimitives.ReadUInt32BigEndian(report.AsSpan(16, 4));
+            double estimateMs = senderBufferMs + networkMs + phoneQueueMs + phoneOutputMs;
+            Color color = estimateMs < 80 ? Color.DarkGreen : estimateMs < 180 ? Color.DarkGoldenrod : Color.DarkRed;
+            SetLatency($"UDP latency ~{estimateMs:0} ms  •  PC {senderBufferMs:0}  •  Wi-Fi {networkMs:0} ms\n iOS queue {phoneQueueMs:0} ms  •  output route {phoneOutputMs:0} ms", color);
+        }
+    }
+
+    private static bool HasTag(byte[] data, string tag)
+    {
+        if (data.Length < tag.Length) return false;
+        for (int i = 0; i < tag.Length; i++) if (data[i] != (byte)tag[i]) return false;
+        return true;
     }
 
     private async Task StreamClient(TcpClient client, CancellationToken token)

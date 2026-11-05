@@ -15,6 +15,8 @@ final class AudioReceiver: ObservableObject {
     private let player = AVAudioPlayerNode()
     private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!
     private var incoming = Data()
+    private var usesUDP = false
+    private var lastUDPSequence: UInt32?
     private var playbackStarted = false
     private let playbackQueueLock = NSLock()
     private var queuedPlaybackFrames = 0
@@ -78,7 +80,7 @@ final class AudioReceiver: ObservableObject {
         b.start(queue: queue)
     }
 
-    func connect(to endpoint: NWEndpoint) {
+    func connect(to endpoint: NWEndpoint, usingUDP: Bool = false) {
         disconnect()
         do {
             let session = AVAudioSession.sharedInstance()
@@ -86,7 +88,9 @@ final class AudioReceiver: ObservableObject {
             try session.setActive(true)
             try engine.start()
         } catch { status = "Audio error: \(error.localizedDescription)"; return }
-        let c = NWConnection(to: endpoint, using: .tcp)
+        usesUDP = usingUDP
+        lastUDPSequence = nil
+        let c = NWConnection(to: endpoint, using: usingUDP ? .udp : .tcp)
         connection = c
         incoming.removeAll()
         playbackStarted = false
@@ -96,8 +100,15 @@ final class AudioReceiver: ObservableObject {
                 guard let self else { return }
                 switch state {
                 case .ready:
-                    self.status = "Playing Windows audio"
-                    self.connected = true
+                    if self.usesUDP {
+                        self.status = "Connecting UDP…"
+                        c.send(content: Data("WFH1".utf8), completion: .contentProcessed { _ in })
+                        self.receiveDatagram(c)
+                    } else {
+                        self.status = "Playing Windows audio"
+                        self.connected = true
+                        self.receive(c)
+                    }
                 case .failed(let error):
                     self.status = "Connection failed: \(error.localizedDescription)"
                     self.connected = false
@@ -108,7 +119,6 @@ final class AudioReceiver: ObservableObject {
             }
         }
         c.start(queue: queue)
-        receive(c)
     }
 
     func connect(qr: String) {
@@ -116,7 +126,8 @@ final class AudioReceiver: ObservableObject {
               let portNumber = url.port, let port = NWEndpoint.Port(rawValue: UInt16(portNumber)) else {
             status = "Invalid pairing QR code"; return
         }
-        connect(to: .hostPort(host: NWEndpoint.Host(host), port: port))
+        let usingUDP = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "transport" && $0.value == "udp" } ?? false
+        connect(to: .hostPort(host: NWEndpoint.Host(host), port: port), usingUDP: usingUDP)
     }
 
     func disconnect() {
@@ -127,6 +138,8 @@ final class AudioReceiver: ObservableObject {
         connection?.cancel(); connection = nil
         player.stop(); engine.stop()
         playbackStarted = false
+        usesUDP = false
+        lastUDPSequence = nil
         connected = false
         status = "Not connected"
     }
@@ -137,6 +150,35 @@ final class AudioReceiver: ObservableObject {
             if let data { self.incoming.append(data); self.parseFrames() }
             if !complete && error == nil { self.receive(c) }
         }
+    }
+
+    private func receiveDatagram(_ c: NWConnection) {
+        c.receiveMessage { [weak self] data, _, _, error in
+            guard let self else { return }
+            if let data { self.parseDatagram(data) }
+            if error == nil { self.receiveDatagram(c) }
+        }
+    }
+
+    private func parseDatagram(_ data: Data) {
+        if data.starts(with: Data("WFOK".utf8)) {
+            DispatchQueue.main.async {
+                self.status = "Playing Windows audio • UDP"
+                self.connected = true
+            }
+            return
+        }
+        if data.starts(with: Data("WFAP".utf8)) {
+            guard data.count == 12 else { return }
+            let token = data[4..<12].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            sendLatencyReport(echoing: token)
+            return
+        }
+        guard data.count > 8, data.starts(with: Data("WFAA".utf8)) else { return }
+        let sequence = data[4..<8].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        if let previous = lastUDPSequence, Int32(bitPattern: sequence &- previous) <= 0 { return }
+        lastUDPSequence = sequence
+        schedule(data.subdata(in: 8..<data.count))
     }
 
     private func parseFrames() {
