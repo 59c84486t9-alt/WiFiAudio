@@ -120,7 +120,7 @@ public sealed class MainForm : Form
                 { await Task.Delay(5, token); continue; }
 
                 // If capture or sending briefly falls behind, discard old audio to stay live.
-                int backlogLimit = capture.WaveFormat.AverageBytesPerSecond * 6 / 100; // 60ms
+                int backlogLimit = capture.WaveFormat.AverageBytesPerSecond * 12 / 100; // 120ms
                 while (buffer.BufferedBytes > backlogLimit)
                 {
                     int discarded = pcm.Read(audioFrame, 4, frameBytes);
