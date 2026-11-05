@@ -101,7 +101,7 @@ public sealed class MainForm : Form
         else if (samples.WaveFormat.Channels != 2) samples = new DownmixToStereoSampleProvider(samples);
         samples = new WdlResamplingSampleProvider(samples, 48000);
         var pcm = new SampleToWaveProvider16(samples);
-        const int frameBytes = 1920; // 10ms, 48kHz, 2ch, 16-bit
+        const int frameBytes = 3840; // 20ms, 48kHz, 2ch, 16-bit
         byte[] audioFrame = new byte[4 + frameBytes];
         byte[] length = new byte[4];
         byte[] pingTimestamp = new byte[8];
@@ -115,8 +115,8 @@ public sealed class MainForm : Form
         {
             while (!token.IsCancellationRequested && client.Connected)
             {
-                // Wait until there is approximately one 10ms frame of source audio.
-                if (buffer.BufferedBytes < capture.WaveFormat.AverageBytesPerSecond / 100)
+                // Wait until there is approximately one 20ms frame of source audio.
+                if (buffer.BufferedBytes < capture.WaveFormat.AverageBytesPerSecond / 50)
                 { await Task.Delay(5, token); continue; }
 
                 // If capture or sending briefly falls behind, discard old audio to stay live.
